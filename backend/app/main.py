@@ -12,6 +12,9 @@ from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 
+# 启动时把仓库里既有的查询日志并入执行账本，保证新旧两批执行在同一本账上。
+store.ingest_legacy_journal()
+
 app = FastAPI(title="多维分析查询与指标平台", version="1.0.0")
 
 app.add_middleware(

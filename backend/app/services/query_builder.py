@@ -51,13 +51,17 @@ class QueryBuilderService(BaseModuleService):
             cached = store.cache_get(cache_key)
             if cached is not None:
                 t_start = time.time()
-                store.log_query(
-                    metric_id=template.get("id", 0),
+                # 缓存命中同样是一笔真实执行：记录实际模板，并沿模板反查指标身份。
+                # 模板编号与指标编号同号时也不能互相替代。
+                store.record_execution(
                     operator=operator,
                     sql_summary=f"缓存命中: {template.get('模板名称')}",
                     row_count=len(cached) if isinstance(cached, list) else 1,
                     duration_ms=(time.time() - t_start) * 1000,
                     status="正常",
+                    source="缓存命中",
+                    template_id=int(template.get("id", 0)),
+                    metric_name=metric_name,
                 )
                 return {"source": "cache", "template": template.get("模板名称"),
                         "caliber": active_caliber.get("版本号"), "rows": cached}
@@ -80,14 +84,17 @@ class QueryBuilderService(BaseModuleService):
         duration_ms = (time.time() - t_start) * 1000
         status = "慢查询" if duration_ms > 100 else "正常"
 
-        # 写入查询日志
-        store.log_query(
-            metric_id=template.get("id", 0),
+        # 写入查询日志：记录的是实际执行模板，指标身份由模板的“关联指标”反查得出，
+        # 不再把模板编号当作指标编号使用。
+        store.record_execution(
             operator=operator,
             sql_summary=f"查询模板: {template.get('模板名称')}, 维度: {template.get('维度组合')}",
             row_count=len(result_rows),
             duration_ms=duration_ms,
             status=status,
+            source="冷执行",
+            template_id=int(template.get("id", 0)),
+            metric_name=metric_name,
         )
 
         # 写入缓存

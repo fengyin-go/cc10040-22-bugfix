@@ -62,14 +62,16 @@ class AnomalyDetectorService(BaseModuleService):
                 threshold=threshold,
             )
 
-        # 更新查询日志中相关的异常记录
-        store.log_query(
-            metric_id=metric_id,
+        # 更新查询日志中相关的异常记录（以指标定义的实际编号与名称入账）
+        store.record_execution(
             operator="异常检测器",
             sql_summary=f"异常检测: {rule.get('规则名称')}, 算法={algorithm}",
             row_count=1,
             duration_ms=10.0,
             status="正常" if not is_anomaly else "异常终止",
+            source="异常检测",
+            metric_id=metric_id,
+            metric_name=metric_name,
         )
 
         return {
@@ -96,8 +98,8 @@ class AnomalyDetectorService(BaseModuleService):
         # 关联查询日志
         for record in records:
             metric_id = record.get("指标ID")
-            related_logs = [log for log in store.query_logs()
-                            if f"metric_{metric_id}" in str(log.get("涉及指标", ""))
+            related_logs = [log for log in store.execution_snapshot()
+                            if log.get("metric_id") == metric_id
                             and "异常" in str(log.get("查询语句摘要", ""))]
             record["related_queries"] = len(related_logs)
 

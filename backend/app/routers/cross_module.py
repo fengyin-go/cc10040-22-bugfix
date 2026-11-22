@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 
 from app.services.metric_definition import MetricDefinitionService
 from app.services.caliber_version import CaliberVersionService
@@ -61,10 +61,10 @@ def get_caliber_history(metric_name: str):
 
 
 @router.post("/query/{template_id}/execute")
-def execute_query(template_id: int, operator: str = "系统"):
-    """执行查询模板，返回结果与日志"""
+def execute_query(template_id: int, operator: str = "系统", use_cache: bool = True):
+    """执行查询模板，返回结果与日志；冷执行与缓存命中都记录实际模板。"""
     svc = QueryBuilderService()
-    return svc.execute_query(template_id, operator=operator)
+    return svc.execute_query(template_id, operator=operator, use_cache=use_cache)
 
 
 @router.post("/data-service/{api_id}/call")
@@ -114,6 +114,29 @@ def query_stats_by_metric():
     """按指标统计查询情况"""
     svc = QueryJournalService()
     return svc.get_query_stats_by_metric()
+
+
+@router.get("/query-journal/detail")
+def query_journal_detail():
+    """指标查询明细：各指标次数、平均耗时与待认领清单（供查询工作台核账）"""
+    svc = QueryJournalService()
+    return svc.get_query_detail()
+
+
+@router.post("/query-journal/{execution_id}/claim")
+def claim_execution(
+    execution_id: int,
+    evidence: str = Body(default="", embed=True),
+    metric_name: str | None = Body(default=None, embed=True),
+    metric_id: int | None = Body(default=None, embed=True),
+    template_id: int | None = Body(default=None, embed=True),
+    operator: str = Body(default="值班员", embed=True),
+):
+    """给待认领的旧执行补录可核实的归属依据"""
+    svc = QueryJournalService()
+    return svc.claim_execution(execution_id, evidence, metric_id=metric_id,
+                               metric_name=metric_name, template_id=template_id,
+                               operator=operator)
 
 
 @router.get("/query-journal/performance-insights")

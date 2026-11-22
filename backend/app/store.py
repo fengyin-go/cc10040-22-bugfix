@@ -11,6 +11,16 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+# 无法证明归属的执行统一归到待认领，不混入任何指标。
+UNCLAIMED = "待认领"
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
 
 class Store:
     def __init__(self) -> None:
@@ -20,8 +30,10 @@ class Store:
         self._id_counters: dict[str, int] = {}
         # Cache layer storage
         self._cache: dict[str, tuple[float, Any]] = {}
-        # Cross-module journal
-        self._query_log: list[dict[str, Any]] = []
+        # 执行账本：每一笔真实执行按执行号（execution_id）只记一次。
+        # _executions 是唯一事实源，列表、统计、补录、动作都读它。
+        self._executions: dict[int, dict[str, Any]] = {}
+        self._exec_cursor: int = 0
         # Cohort snapshots
         self._cohort_snapshots: dict[str, list[dict[str, Any]]] = {}
         # Anomaly records
@@ -80,27 +92,240 @@ class Store:
     def find_by_status(self, module: str, status: str) -> list[dict[str, Any]]:
         return [row for row in self.rows(module) if row.get("status") == status]
 
-    # ── Query journal ──
+    # ── 执行账本 / 查询日志 ──
+    #
+    # 一笔执行 = 一个 execution_id，从产生到补录归属都只入账一次。
+    # 查询日志的列表和统计都读这本账，避免“日志列表拆成两组”。
+    # 归属只认能证明的指标身份：
+    #   * 模板身份（query_builder.id）与指标身份（metric_definition.id）分开存，
+    #     同号时绝不互相替代；
+    #   * 模板 -> “关联指标”名称 -> 指标记录 才是可核实的链路；
+    #   * 证明不了的一律 UNCLAIMED，留在待认领，不进入任何指标统计。
 
-    def log_query(self, metric_id: int, operator: str, sql_summary: str,
-                  row_count: int, duration_ms: float, status: str = "正常") -> dict[str, Any]:
+    def _metric_by_name(self, metric_name: str) -> dict[str, Any] | None:
+        for row in self.rows("metric_definition"):
+            if row.get("指标名称") == metric_name:
+                return row
+        return None
+
+    def _resolve_template(self, template_id: int | None) -> dict[str, Any] | None:
+        if template_id is None:
+            return None
+        return self.find("query_builder", int(template_id))
+
+    def _proven_identity(self, template_id: int | None,
+                         metric_id: int | None,
+                         metric_name: str | None) -> tuple[dict[str, Any] | None, str]:
+        """返回 (证据化身份, 证据说明)；无法证明时返回 (None, 原因)。
+
+        优先用实际模板反查关联指标，这是执行时能留下的事实。
+        没有模板时，只接受能直接落到指标定义上的指标 ID/名称，且要求两者一致，
+        防止把同号的模板 ID 当成指标 ID。
+        """
+        template = self._resolve_template(template_id)
+        if template is not None:
+            linked_name = template.get("关联指标", "")
+            metric = self._metric_by_name(linked_name)
+            if metric is None:
+                return None, f"模板#{template_id}关联的指标「{linked_name}」不存在"
+            if metric_name and metric_name != linked_name:
+                return None, f"模板#{template_id}关联「{linked_name}」，与声明的「{metric_name}」不符"
+            if metric_id is not None and int(metric_id) != int(metric["id"]):
+                return None, (f"模板#{template_id}关联指标#{metric['id']}，"
+                              f"与声明的指标#{metric_id}不符")
+            return {
+                "metric_id": int(metric["id"]),
+                "metric_name": metric["指标名称"],
+                "template_id": int(template["id"]),
+                "template_name": template.get("模板名称", ""),
+                "evidence": f"模板#{template['id']}→关联指标「{metric['指标名称']}」",
+            }, ""
+        if metric_name:
+            metric = self._metric_by_name(metric_name)
+            if metric is None:
+                return None, f"指标「{metric_name}」不存在"
+            if metric_id is not None and int(metric_id) != int(metric["id"]):
+                return None, f"指标「{metric_name}」的编号是#{metric['id']}，与声明的 #{metric_id} 不符"
+            return {
+                "metric_id": int(metric["id"]),
+                "metric_name": metric["指标名称"],
+                "template_id": None,
+                "template_name": None,
+                "evidence": f"指标定义#{metric['id']}「{metric['指标名称']}」",
+            }, ""
+        if metric_id is not None:
+            metric = self.find("metric_definition", int(metric_id))
+            if metric is None:
+                return None, f"指标#{metric_id}不存在；单独的编号不能证明归属"
+            return {
+                "metric_id": int(metric["id"]),
+                "metric_name": metric["指标名称"],
+                "template_id": None,
+                "template_name": None,
+                "evidence": f"指标定义#{metric['id']}「{metric['指标名称']}」",
+            }, ""
+        return None, "没有可核实的模板或指标身份"
+
+    def _make_execution(self, *, operator: str, sql_summary: str, row_count: int,
+                        duration_ms: float, status: str, source: str,
+                        template_id: int | None = None, metric_id: int | None = None,
+                        metric_name: str | None = None, evidence: str = "",
+                        source_batch: str = "live", legacy: bool = False,
+                        claimed_by: str | None = None) -> dict[str, Any]:
+        identity, reason = self._proven_identity(template_id, metric_id, metric_name)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        unclaimed = identity is None
         entry = {
-            "id": len(self._query_log) + 1,
-            "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "id": 0,
+            "execution_id": 0,
+            "查询时间": now,
             "操作人": operator,
-            "涉及指标": f"metric_{metric_id}",
+            "涉及指标": UNCLAIMED if unclaimed else identity["metric_name"],
             "查询语句摘要": sql_summary,
             "返回行数": str(row_count),
             "status": status,
-            "duration_ms": duration_ms,
+            "duration_ms": round(float(duration_ms), 2),
             "pending": status != "正常",
             "abnormal": status in ("慢查询", "异常终止"),
+            "source": source,
+            "source_batch": source_batch,
+            "legacy": legacy,
+            "attribution": UNCLAIMED if unclaimed else "已归属",
+            "metric_id": identity["metric_id"] if identity else None,
+            "metric_name": identity["metric_name"] if identity else None,
+            "template_id": identity["template_id"] if identity else template_id,
+            "template_name": (identity["template_name"] if identity else None),
+            "evidence": (identity["evidence"] if identity else evidence),
+            "unclaimed_reason": reason if unclaimed else "",
+            "claimed_at": now if unclaimed and legacy else None,
+            "claimed_by": claimed_by if unclaimed else None,
         }
-        self._query_log.append(entry)
         return entry
 
+    def _append_execution(self, entry: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._exec_cursor += 1
+            entry["execution_id"] = self._exec_cursor
+            entry["id"] = self._exec_cursor
+            self._executions[self._exec_cursor] = entry
+            return dict(entry)
+
+    def record_execution(self, *, operator: str, sql_summary: str, row_count: int,
+                         duration_ms: float, status: str = "正常", source: str = "冷执行",
+                         template_id: int | None = None, metric_id: int | None = None,
+                         metric_name: str | None = None, evidence: str = "",
+                         source_batch: str = "live") -> dict[str, Any]:
+        """记录一笔实际执行；冷执行和缓存命中都要落账，身份取自实际模板。"""
+        entry = self._make_execution(
+            operator=operator, sql_summary=sql_summary, row_count=row_count,
+            duration_ms=duration_ms, status=status, source=source,
+            template_id=template_id, metric_id=metric_id, metric_name=metric_name,
+            evidence=evidence, source_batch=source_batch,
+        )
+        return self._append_execution(entry)
+
+    def log_query(self, metric_id: int, operator: str, sql_summary: str,
+                  row_count: int, duration_ms: float, status: str = "正常") -> dict[str, Any]:
+        """旧调用方的兼容入口：一律进待认领，不按编号猜归属。
+
+        旧实现把模板编号当指标编号传进来，同一个数字既可能是模板也可能是指标；
+        仅凭编号无法证明这是哪一边的身份，更不能因为“同号”就把执行记到别的指标上。
+        这类执行会在待认领里保留原始编号，等值班员补录可核实的依据后再并回。
+        """
+        entry = self.record_execution(
+            operator=operator, sql_summary=sql_summary, row_count=row_count,
+            duration_ms=duration_ms, status=status, source="冷执行",
+            evidence=f"旧的 metric_{metric_id} 标记，无法证明是模板还是指标",
+            source_batch="legacy",
+        )
+        with self._lock:
+            entry = self._executions[entry["execution_id"]]
+            entry["template_id"] = int(metric_id) if str(metric_id).isdigit() else None
+            entry["unclaimed_reason"] = (
+                f"旧日志只有 metric_{metric_id} 标记，模板与指标同号时无法证明归属")
+            return dict(entry)
+
+    def execution_snapshot(self) -> list[dict[str, Any]]:
+        """同一轮统计取同一份快照：不会把半批新执行混进来。"""
+        with self._lock:
+            return [dict(entry) for entry in
+                    sorted(self._executions.values(), key=lambda e: e["execution_id"])]
+
     def query_logs(self) -> list[dict[str, Any]]:
-        return self._query_log
+        return self.execution_snapshot()
+
+    def find_execution(self, execution_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            entry = self._executions.get(int(execution_id))
+            return dict(entry) if entry is not None else None
+
+    def claim_execution(self, execution_id: int, *, evidence: str,
+                        metric_id: int | None = None, metric_name: str | None = None,
+                        template_id: int | None = None,
+                        operator: str = "值班员") -> tuple[dict[str, Any] | None, str]:
+        """给待认领执行补录可核实的归属依据；已归属的不会再入账一次。"""
+        if not str(evidence or "").strip():
+            return None, "补录必须填写可核实的归属依据"
+        with self._lock:
+            entry = self._executions.get(int(execution_id))
+            if entry is None:
+                return None, f"执行 {execution_id} 不存在"
+            if entry.get("attribution") != UNCLAIMED:
+                return None, (f"执行 {execution_id} 已归属指标「{entry.get('metric_name')}」，"
+                              "一笔执行只入账一次")
+            identity, reason = self._proven_identity(template_id, metric_id, metric_name)
+            if identity is None:
+                return None, f"归属依据不足：{reason}"
+            entry.update({
+                "涉及指标": identity["metric_name"],
+                "attribution": "已归属",
+                "metric_id": identity["metric_id"],
+                "metric_name": identity["metric_name"],
+                "template_id": identity["template_id"] or entry.get("template_id"),
+                "template_name": identity["template_name"] or entry.get("template_name"),
+                "evidence": str(evidence).strip(),
+                "unclaimed_reason": "",
+                "claimed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "claimed_by": operator,
+            })
+            return dict(entry), ""
+
+    def ingest_legacy_journal(self) -> int:
+        """把仓库里既有的查询日志并入执行账本，保留原编号以便归并前后追同一笔。
+
+        幂等：重复调用不会把同一笔旧执行再入账一次。
+        """
+        ingested = 0
+        for row in self.rows("query_journal"):
+            execution_id = int(row.get("id", 0)) or (max(self._executions, default=0) + 1)
+            if execution_id in self._executions:
+                # 同号的旧日志已经入账，按“一笔只入账一次”跳过。
+                continue
+            entry = self._make_execution(
+                operator=str(row.get("操作人", "旧日志")),
+                sql_summary=str(row.get("查询语句摘要", "")),
+                row_count=_as_int(row.get("返回行数")),
+                duration_ms=float(row.get("duration_ms", 0) or 0),
+                status=str(row.get("status", "正常")),
+                source=str(row.get("source", "旧日志")),
+                template_id=row.get("template_id"),
+                metric_id=row.get("metric_id"),
+                metric_name=row.get("metric_name"),
+                evidence=str(row.get("evidence", "")),
+                source_batch=str(row.get("source_batch", "legacy")),
+                legacy=True,
+                claimed_by=row.get("claimed_by"),
+            )
+            entry["查询时间"] = str(row.get("查询时间", entry["查询时间"]))
+            if row.get("attribution") == "已归属" and entry["attribution"] == UNCLAIMED:
+                # 旧日志只有在带得动可核实身份时才保留归属，否则回落待认领。
+                entry["unclaimed_reason"] = "旧日志没有可核实身份"
+            entry["execution_id"] = execution_id
+            entry["id"] = execution_id
+            self._executions[execution_id] = entry
+            self._exec_cursor = max(self._exec_cursor, execution_id)
+            ingested += 1
+        return ingested
 
     # ── Cache operations ──
 

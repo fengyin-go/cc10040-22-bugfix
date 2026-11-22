@@ -79,5 +79,24 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 查询日志核账口径
+
+查询构建器每次执行（冷执行、缓存命中）都记入同一本执行账本，一笔执行只有一个
+`execution_id`，从产生到补录归属都只入账一次。核账规则：
+
+- 模板身份（`query_builder.id`）和指标身份（`metric_definition.id`）分开存，
+  同号时不能互相替代；
+- 归属只认可核实的链路：实际模板 → `关联指标` 名称 → 指标定义；
+- 证明不了归属的进“待认领”，不混进任何指标；值班员补录依据后并回原指标；
+- 统计每次按当前有效明细重算，归并前后都能用 `execution_id` 追到同一笔执行。
+
+相关接口：
+
+```text
+GET  /api/cross/query-journal/detail          指标查询明细（次数/平均耗时/待认领）
+POST /api/cross/query-journal/{id}/claim      补录归属依据（evidence 必填，可带 metric_name/template_id）
+POST /api/cross/query/{template_id}/execute   执行模板（use_cache=false 冷跑，true 可命中缓存）
+```
+
 领域：数据工程
 子方向：数据分析与数据应用

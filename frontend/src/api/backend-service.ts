@@ -1,6 +1,12 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  OverviewResult,
+  PageResult,
+  QueryDetail,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +63,22 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+export async function loadQueryDetail(): Promise<QueryDetail> {
+  const response = await request('/api/cross/query-journal/detail')
+  if (!response.ok) throw new Error('指标查询明细读取失败')
+  return await response.json()
+}
+
+export async function claimExecution(
+  executionId: number,
+  payload: { evidence: string; metric_name?: string; template_id?: number },
+): Promise<ActionResult> {
+  const response = await request(`/api/cross/query-journal/${executionId}/claim`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
   return await response.json()
 }
